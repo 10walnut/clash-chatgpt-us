@@ -1,0 +1,117 @@
+# Clash for Windows 配置文件预处理（Parser）
+# 用途：把 ChatGPT / OpenAI 网页及其必要依赖固定到美国节点。
+# 安装：Settings -> Profiles -> Parsers -> Edit，粘贴本文件全部内容并保存，
+#       然后回到 Profiles 更新一次订阅。
+#
+# 默认 reg: ^.*$ 会处理全部订阅；若只想处理一个订阅，可将 reg 改成对应订阅 URL：
+#   url: https://你的订阅地址
+
+parsers:
+  - reg: ^.*$
+    code: |
+      module.exports.parse = async (raw, { yaml, notify, console }) => {
+        const GROUP = '🤖 ChatGPT-US'
+        const AUTO_GROUP = '🇺🇸 美国自动选择'
+
+        let config
+        try {
+          config = yaml.parse(raw)
+        } catch (error) {
+          notify('ChatGPT-US 预处理失败', `订阅 YAML 无法解析：${error.message}`, false)
+          return raw
+        }
+
+        const proxies = Array.isArray(config.proxies) ? config.proxies : []
+        const usNamePattern = /🇺🇸|美国|美國|United\s*States|(?:^|[| _-])US(?:$|[| _-])|(?:^|[| _-])USA(?:$|[| _-])/i
+        const usNodes = [...new Set(
+          proxies
+            .map(proxy => proxy && proxy.name)
+            .filter(name => typeof name === 'string' && usNamePattern.test(name))
+        )]
+
+        // 不允许回退到 DIRECT 或其他国家，避免美国节点失效时发生地区泄漏。
+        if (usNodes.length === 0) {
+          notify('ChatGPT-US 预处理未生效', '订阅中没有识别到美国节点；已保留原配置。', false)
+          return raw
+        }
+
+        const originalGroups = Array.isArray(config['proxy-groups'])
+          ? config['proxy-groups']
+          : []
+
+        config['proxy-groups'] = originalGroups.filter(group =>
+          !group || (group.name !== GROUP && group.name !== AUTO_GROUP)
+        )
+
+        // 自动选择组内只有美国节点；ChatGPT 组也只引用该组和美国节点。
+        config['proxy-groups'].unshift(
+          {
+            name: AUTO_GROUP,
+            type: 'url-test',
+            proxies: usNodes,
+            url: 'https://www.gstatic.com/generate_204',
+            interval: 300,
+            tolerance: 80,
+            lazy: true
+          },
+          {
+            name: GROUP,
+            type: 'select',
+            proxies: [AUTO_GROUP, ...usNodes]
+          }
+        )
+
+        // 把 ChatGPT-US 作为一个可选项加入订阅原有的主线路选择组。
+        // 默认追加在末尾，不改变机场原来的默认选择；需要时可在这些组中手动选它，
+        // 让其他原本走主线路的国外网站也使用同一条美国线路。
+        const mainSelectorPattern = /节点选择|选择线路|代理选择|代理节点|线路选择|手动选择|手动切换/i
+        for (const group of config['proxy-groups']) {
+          if (!group || group.name === GROUP || group.name === AUTO_GROUP) continue
+          if (group.type !== 'select' || !Array.isArray(group.proxies)) continue
+          if (!mainSelectorPattern.test(group.name)) continue
+
+          group.proxies = [
+            ...group.proxies.filter(name => name !== GROUP),
+            GROUP
+          ]
+        }
+
+        // 核心域名 + OpenAI 官方列出的网页/登录/上传依赖域名。
+        // 这些规则必须位于订阅原有规则之前，才能优先命中。
+        const chatgptRules = [
+          `DOMAIN-SUFFIX,chatgpt.com,${GROUP}`,
+          `DOMAIN-SUFFIX,openai.com,${GROUP}`,
+          `DOMAIN-SUFFIX,oaistatic.com,${GROUP}`,
+          `DOMAIN-SUFFIX,oaiusercontent.com,${GROUP}`,
+          `DOMAIN-SUFFIX,oaistatsig.com,${GROUP}`,
+          `DOMAIN-SUFFIX,openaimerge.com,${GROUP}`,
+          `DOMAIN-SUFFIX,ct.sendgrid.net,${GROUP}`,
+          `DOMAIN-SUFFIX,intercom.io,${GROUP}`,
+          `DOMAIN-SUFFIX,intercomcdn.com,${GROUP}`,
+          `DOMAIN,cdn.workos.com,${GROUP}`,
+          `DOMAIN,forwarder.workos.com,${GROUP}`,
+          `DOMAIN,images.workoscdn.com,${GROUP}`,
+          `DOMAIN,setup.workos.com,${GROUP}`,
+          `DOMAIN,workos.imgix.net,${GROUP}`,
+          `DOMAIN,challenges.cloudflare.com,${GROUP}`,
+          `DOMAIN,humb.apple.com,${GROUP}`,
+          `DOMAIN,js.stripe.com,${GROUP}`,
+          `DOMAIN,o207216.ingest.sentry.io,${GROUP}`,
+          `DOMAIN,o33249.ingest.sentry.io,${GROUP}`,
+          `DOMAIN,rum.browser-intake-datadoghq.com,${GROUP}`
+        ]
+
+        const originalRules = Array.isArray(config.rules) ? config.rules : []
+        const generatedDomains = new Set(chatgptRules.map(rule => rule.split(',').slice(0, 2).join(',')))
+
+        // 去掉旧副本，保证重复刷新订阅时不会产生重复规则。
+        const cleanedRules = originalRules.filter(rule => {
+          if (typeof rule !== 'string') return true
+          return !generatedDomains.has(rule.split(',').slice(0, 2).join(','))
+        })
+
+        config.rules = [...chatgptRules, ...cleanedRules]
+        console.info(`[ChatGPT-US] 已加入 ${usNodes.length} 个美国节点和 ${chatgptRules.length} 条规则`)
+        return yaml.stringify(config)
+      }
+
